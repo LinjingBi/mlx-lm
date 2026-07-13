@@ -239,3 +239,23 @@ Use the local runtime when:
 Use `mlx_lm.server` when several callers must make progress simultaneously,
 continuous batching matters, OpenAI API compatibility is required, or the
 caller is not able to access a local Unix socket.
+
+## Maintaining the downstream patch
+
+The fork keeps `main` as a clean mirror of `ml-explore/mlx-lm:main`. Runtime
+changes live only on `codex/unix-native-runtime`.
+
+Two GitHub Actions workflows maintain this arrangement:
+
+- `Local Runtime CI` runs formatting, lint, the focused runtime tests, a
+  lightweight-client import check, and a wheel-content check on patched pushes
+  and pull requests.
+- `Sync Upstream Into Local Runtime` runs every Monday at 03:17 Asia/Shanghai
+  and on manual dispatch. It fast-forwards fork `main`, creates an
+  `automation/sync-<upstream-sha>` branch, merges upstream into that candidate,
+  validates it, and opens a pull request into the patched branch.
+
+The sync workflow does not rebase, force-push, or modify the patched branch
+directly. Merge conflicts and test failures stop the run for manual attention.
+Because scheduled GitHub Actions run from the repository's default branch, the
+fork should use `codex/unix-native-runtime` as its default branch.
