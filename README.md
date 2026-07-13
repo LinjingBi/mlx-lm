@@ -1,293 +1,261 @@
-## MLX LM 
+# MLX-LM Local Runtime
 
-MLX LM is a Python package for generating text and fine-tuning large language
-models on Apple silicon with MLX.
+The local runtime keeps one MLX model and its prompt caches resident in a
+per-user macOS daemon. Short-lived Python programs and shell integrations call
+the daemon through a Unix domain socket instead of HTTP.
 
-Some key features include:
+This interface is deliberately optimized for sequential, latency-sensitive
+local work such as shell-command completion. It is not a replacement for
+`mlx_lm.server` when several requests need to run concurrently.
 
-* Integration with the Hugging Face Hub to easily use thousands of LLMs with a
-  single command. 
-* Support for quantizing and uploading models to the Hugging Face Hub.
-* [Low-rank and full model
-  fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
-  with support for quantized models.
-* Distributed inference and fine-tuning with `mx.distributed`
+## Main features
 
-The easiest way to get started is to install the `mlx-lm` package:
+- Direct inference through `mlx_lm.stream_generate`; there is no HTTP,
+  OpenAI-compatible request handling, or SSE layer.
+- One model loaded once and retained for the lifetime of the daemon.
+- Full-prompt requests with automatic nearest-prefix matching through
+  `LRUPromptCache`.
+- Transactional cache updates: a failed or disconnected request does not mutate
+  an existing cached entry.
+- Streaming and non-streaming Python APIs.
+- A versioned, length-prefixed JSON protocol over an `AF_UNIX` stream socket.
+- A foreground daemon suitable for supervision by macOS `launchd`.
+- Health, status, cache-clear, and shutdown operations.
+- Socket directory mode `0700` and socket mode `0600` by default.
 
-**With `pip`**:
+## Install this checkout
 
 ```sh
-pip install mlx-lm
+cd ~/mlx-lm-unix-runtime
+git switch codex/unix-native-runtime
+
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e .
+source .venv/bin/activate
 ```
 
-**With `conda`**:
+The examples below use `mlx-community/Qwen3-4B-Instruct-2507-4bit`, but a local
+model directory can be supplied instead.
+
+## Run the daemon in the foreground
 
 ```sh
-conda install -c conda-forge mlx-lm
+mlx_lm.runtime serve \
+  --model mlx-community/Qwen3-4B-Instruct-2507-4bit \
+  --prompt-cache-size 4 \
+  --prompt-cache-bytes 2G \
+  --prefill-step-size 2048
 ```
 
-### Quick Start
+The default socket is:
 
-To generate text with an LLM use:
-
-```bash
-mlx_lm.generate --prompt "How tall is Mt Everest?"
+```text
+~/Library/Caches/mlx-lm-runtime/runtime.sock
 ```
 
-To chat with an LLM use:
+Use `--socket` on both the daemon and client commands to override it.
 
-```bash
-mlx_lm.chat
-```
+## Python client
 
-This will give you a chat REPL that you can use to interact with the LLM. The
-chat context is preserved during the lifetime of the REPL.
-
-Commands in `mlx-lm` typically take command line options which let you specify
-the model, sampling parameters, and more. Use `-h` to see a list of available
-options for a command, e.g.:
-
-```bash
-mlx_lm.generate -h
-```
-
-The default model for generation and chat is
-`mlx-community/Llama-3.2-3B-Instruct-4bit`.  You can specify any MLX-compatible
-model with the `--model` flag. Thousands are available in the
-[MLX Community](https://huggingface.co/mlx-community) Hugging Face
-organization.
-
-### Sequential local Unix-socket runtime
-
-This branch also includes an optional macOS-local runtime that keeps one model
-and its prompt cache resident behind a Unix domain socket. It uses the direct
-Python generation API, accepts one inference request at a time, and does not use
-the HTTP server or `BatchGenerator`. See the [local runtime
-README](mlx_lm/local_runtime/README.md) for installation, Python and CLI usage,
-cache semantics, LaunchAgent setup, and the explicit gaps compared with
-`mlx_lm.server`.
-
-### Python API
-
-You can use `mlx-lm` as a module:
+The client does not import MLX or load model weights.
 
 ```python
-from mlx_lm import load, generate
+from mlx_lm_runtime import UnixRuntimeClient
 
-model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
+client = UnixRuntimeClient()
+result = client.generate(
+    messages=[
+        {"role": "system", "content": "Return one shell command."},
+        {"role": "user", "content": "Complete: git che"},
+    ],
+    max_tokens=64,
+    temperature=0,
+    stop=("\n",),
 )
 
-text = generate(model, tokenizer, prompt=prompt, verbose=True)
+print(result.text)
+print("cached tokens:", result.started.cached_tokens)
+print("TTFT:", result.finished.ttft_seconds)
 ```
 
-To see a description of all the arguments you can do:
-
-```
->>> help(generate)
-```
-
-Check out the [generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
-to see how to use the API in more detail. Check out the [batch generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
-to see how to efficiently generate continuations for a batch of prompts.
-
-The `mlx-lm` package also comes with functionality to quantize and optionally
-upload models to the Hugging Face Hub.
-
-You can convert models using the Python API:
+Streaming returns token deltas:
 
 ```python
-from mlx_lm import convert
-
-repo = "mistralai/Mistral-7B-Instruct-v0.3"
-upload_repo = "mlx-community/My-Mistral-7B-Instruct-v0.3-4bit"
-
-convert(repo, quantize=True, upload_repo=upload_repo)
+for delta in client.stream_generate(
+    prompt="Complete this command: git che",
+    max_tokens=64,
+    temperature=0,
+    stop=("\n",),
+):
+    print(delta.text, end="", flush=True)
 ```
 
-This will generate a 4-bit quantized Mistral 7B and upload it to the repo
-`mlx-community/My-Mistral-7B-Instruct-v0.3-4bit`. It will also save the
-converted model in the path `mlx_model` by default.
+Send the complete prompt or complete message history on every request. The
+daemon owns tokenization and determines the reusable token prefix. Do not send
+only a manually calculated suffix.
 
-To see a description of all the arguments you can do:
+## Command-line client
 
-```
->>> help(convert)
-```
+```sh
+mlx_lm.runtime health
+mlx_lm.runtime status
 
-#### Streaming
+mlx_lm.runtime generate \
+  --prompt "Complete this command: git che" \
+  --max-tokens 64 \
+  --temperature 0 \
+  --stop $'\n' \
+  --verbose
 
-For streaming generation, use the `stream_generate` function. This yields
-a generation response object.
-
-For example,
-
-```python
-from mlx_lm import load, stream_generate
-
-repo = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-model, tokenizer = load(repo)
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
-)
-
-for response in stream_generate(model, tokenizer, prompt, max_tokens=512):
-    print(response.text, end="", flush=True)
-print()
+mlx_lm.runtime clear-cache
+mlx_lm.runtime shutdown
 ```
 
-#### Sampling
+Chat messages can be passed as JSON:
 
-The `generate` and `stream_generate` functions accept `sampler` and
-`logits_processors` keyword arguments. A sampler is any callable which accepts
-a possibly batched logits array and returns an array of sampled tokens.  The
-`logits_processors` must be a list of callables which take the token history
-and current logits as input and return the processed logits. The logits
-processors are applied in order.
-
-Some standard sampling functions and logits processors are provided in
-`mlx_lm.sample_utils`.
-
-### Command Line
-
-You can also use `mlx-lm` from the command line with:
-
-```
-mlx_lm.generate --model mistralai/Mistral-7B-Instruct-v0.3 --prompt "hello"
+```sh
+mlx_lm.runtime generate \
+  --messages-json '[{"role":"user","content":"Say hello"}]' \
+  --max-tokens 32
 ```
 
-This will download a Mistral 7B model from the Hugging Face Hub and generate
-text using the given prompt.
+The model tokenizer must provide a chat template for message requests. Models
+without one can still be used with a rendered raw prompt.
 
-For a full list of options run:
+## Install as a macOS LaunchAgent
 
-```
-mlx_lm.generate --help
-```
+Run this command from the Python environment where the checkout is installed:
 
-To quantize a model from the command line run:
-
-```
-mlx_lm.convert --model mistralai/Mistral-7B-Instruct-v0.3 -q
-```
-
-For more options run:
-
-```
-mlx_lm.convert --help
+```sh
+mlx_lm.runtime install-launch-agent \
+  --model mlx-community/Qwen3-4B-Instruct-2507-4bit \
+  --prompt-cache-size 4 \
+  --prompt-cache-bytes 2G
 ```
 
-You can upload new models to Hugging Face by specifying `--upload-repo` to
-`convert`. For example, to upload a quantized Mistral-7B model to the
-[MLX Hugging Face community](https://huggingface.co/mlx-community) you can do:
+It writes and starts:
 
-```
-mlx_lm.convert \
-    --model mistralai/Mistral-7B-Instruct-v0.3 \
-    -q \
-    --upload-repo mlx-community/my-4bit-mistral
+```text
+~/Library/LaunchAgents/com.mlx-lm.local-runtime.plist
 ```
 
-Models can also be converted and quantized directly in the
-[mlx-my-repo](https://huggingface.co/spaces/mlx-community/mlx-my-repo) Hugging
-Face Space.
+Logs are written under:
 
-### Long Prompts and Generations 
-
-`mlx-lm` has some tools to scale efficiently to long prompts and generations:
-
-- A rotating fixed-size key-value cache.
-- Prompt caching
-
-To use the rotating key-value cache pass the argument `--max-kv-size n` where
-`n` can be any integer. Smaller values like `512` will use very little RAM but
-result in worse quality. Larger values like `4096` or higher will use more RAM
-but have better quality.
-
-Caching prompts can substantially speedup reusing the same long context with
-different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:
-
-```bash
-cat prompt.txt | mlx_lm.cache_prompt \
-  --model mistralai/Mistral-7B-Instruct-v0.3 \
-  --prompt - \
-  --prompt-cache-file mistral_prompt.safetensors
-``` 
-
-Then use the cached prompt with `mlx_lm.generate`:
-
-```
-mlx_lm.generate \
-    --prompt-cache-file mistral_prompt.safetensors \
-    --prompt "\nSummarize the above text."
+```text
+~/Library/Logs/mlx-lm-runtime/
 ```
 
-The cached prompt is treated as a prefix to the supplied prompt. Also notice
-when using a cached prompt, the model to use is read from the cache and need
-not be supplied explicitly.
+The LaunchAgent uses the absolute path of the Python interpreter that executes
+the install command. Moving or deleting that environment will break the agent.
 
-Prompt caching can also be used in the Python API in order to avoid
-recomputing the prompt. This is useful in multi-turn dialogues or across
-requests that use the same context. See the
-[example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
-for more usage details.
+Remove it with:
 
-### Supported Models
-
-`mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
-model you want to run is not supported, file an
-[issue](https://github.com/ml-explore/mlx-lm/issues/new) or better yet, submit
-a pull request. Many supported models are available in various quantization
-formats in the [MLX Community](https://huggingface.co/mlx-community) Hugging
-Face organization.
-
-For some models the tokenizer may require you to enable the `trust_remote_code`
-option. You can do this by passing `--trust-remote-code` in the command line.
-If you don't specify the flag explicitly, you will be prompted to trust remote
-code in the terminal when running the model. 
-
-Tokenizer options can also be set in the Python API. For example:
-
-```python
-model, tokenizer = load(
-    "qwen/Qwen-7B",
-    tokenizer_config={"eos_token": "<|endoftext|>", "trust_remote_code": True},
-)
+```sh
+mlx_lm.runtime uninstall-launch-agent
 ```
 
-### Large Models
+## Cache behavior
 
-> [!NOTE]
-    This requires macOS 15.0 or higher to work.
+The runtime applies the model's chat template, tokenizes the complete request,
+and looks up the nearest cached sequence. A shorter cached sequence is reused
+directly. A longer cached branch may be copied and trimmed to its common prefix
+when the model's cache type supports trimming.
 
-Models which are large relative to the total RAM available on the machine can
-be slow. `mlx-lm` will attempt to make them faster by wiring the memory
-occupied by the model and cache. This requires macOS 15 or higher to
-work.
+Only the uncached suffix is processed by the model. At successful completion,
+the daemon inserts the prompt plus generated token IDs into the LRU. The cache
+has both entry-count and byte limits.
 
-If you see the following warning message:
+Prompt caches are in memory only and are lost when the daemon exits. Cache reuse
+also depends on stable prompt serialization: changing a token near the beginning
+of a prompt invalidates everything after it.
 
-> [WARNING] Generating with a model that requires ...
+Some hybrid, recurrent, sliding-window, or model-specific cache implementations
+cannot be trimmed safely. Such models may reuse fewer prefixes or fall back to
+full prompt processing. The local runtime inherits those constraints from
+`mlx-lm`; the Unix transport does not change them.
 
-then the model will likely be slow on the given machine. If the model fits in
-RAM then it can often be sped up by increasing the system wired memory limit.
-To increase the limit, set the following `sysctl`:
+## Protocol
 
-```bash
-sudo sysctl iogpu.wired_limit_mb=N
-```
+Each socket message contains a four-byte unsigned big-endian length followed by
+a UTF-8 JSON object. Protocol version 1 supports these operations:
 
-The value `N` should be larger than the size of the model in megabytes but
-smaller than the memory size of the machine.
+- `health`
+- `status`
+- `generate`
+- `clear_cache`
+- `shutdown`
+
+Generation emits `started`, `delta`, and `finished` frames. Every request and
+response contains the protocol version and request ID. Frames are limited to 8
+MiB by default. Python `pickle` is intentionally not used.
+
+One connection carries one operation and closes after the response. This keeps
+the client simple and works well for short-lived shell processes.
+
+## Gaps compared with `mlx_lm.server`
+
+| Capability | Local runtime | `mlx_lm.server` |
+|---|---|---|
+| Active inference | Exactly one | Multiple requests |
+| Continuous batching | Not supported | Uses `BatchGenerator` |
+| Prompt/decode concurrency | Not supported | Configurable |
+| Scheduling | Connections wait serially | Batched request scheduler |
+| Transport | Same-machine Unix socket | OpenAI-like HTTP API |
+| OpenAI SDK compatibility | No | Yes |
+| Network or browser access | No | HTTP, streaming, and CORS |
+| Resident models | One fixed startup model | Configured/on-demand model loading |
+| Per-request model or adapter | No | Supported |
+| Prefix LRU prompt cache | Yes | Yes |
+| Batched segment checkpoints | No | System/user/assistant segments |
+| Streaming text | Yes | Yes |
+| Tool-call response formatting | No | Supported |
+| Reasoning-content separation | No | Supported |
+| Logprobs and top-logprobs | No | Supported |
+| Logit bias and penalties | No | Supported |
+| Draft/speculative generation | No | Supported on the sequential path |
+| Distributed inference | No | Supported |
+| Status during generation | Waits behind generation | HTTP worker remains responsive |
+| Cache persistence after exit | No | No by default |
+
+The daemon listens with a socket backlog of one but does not execute requests in
+parallel. A second client may connect and then wait until the current generation
+finishes. This is intentional: one worker owns all MLX execution and all mutable
+cache state.
+
+The local runtime currently exposes temperature, top-p, top-k, min-p, seed,
+maximum tokens, and stop strings. The narrower surface keeps the sequential path
+small and auditable.
+
+## When to use which interface
+
+Use the local runtime when:
+
+- all callers are on the same Mac;
+- client processes are short lived;
+- latency matters more than aggregate throughput;
+- inference is naturally sequential;
+- one resident model is enough.
+
+Use `mlx_lm.server` when several callers must make progress simultaneously,
+continuous batching matters, OpenAI API compatibility is required, or the
+caller is not able to access a local Unix socket.
+
+## Maintaining the downstream patch
+
+The fork keeps `main` as a clean mirror of `ml-explore/mlx-lm:main`. Runtime
+changes live only on `codex/unix-native-runtime`.
+
+Two GitHub Actions workflows maintain this arrangement:
+
+- `Local Runtime CI` runs formatting, lint, the focused runtime tests, a
+  lightweight-client import check, and a wheel-content check on patched pushes
+  and pull requests.
+- `Sync Upstream Into Local Runtime` runs every Monday at 03:17 Asia/Shanghai
+  and on manual dispatch. It fast-forwards fork `main`, creates an
+  `automation/sync-<upstream-sha>` branch, merges upstream into that candidate,
+  validates it, and opens a pull request into the patched branch.
+
+The sync workflow does not rebase, force-push, or modify the patched branch
+directly. Merge conflicts and test failures stop the run for manual attention.
+Because scheduled GitHub Actions run from the repository's default branch, the
+fork should use `codex/unix-native-runtime` as its default branch.
