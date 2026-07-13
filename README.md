@@ -58,6 +58,16 @@ model with the `--model` flag. Thousands are available in the
 [MLX Community](https://huggingface.co/mlx-community) Hugging Face
 organization.
 
+### Sequential local Unix-socket runtime
+
+This branch also includes an optional macOS-local runtime that keeps one model
+and its prompt cache resident behind a Unix domain socket. It uses the direct
+Python generation API, accepts one inference request at a time, and does not use
+the HTTP server or `BatchGenerator`. See the [local runtime
+README](mlx_lm/local_runtime/README.md) for installation, Python and CLI usage,
+cache semantics, LaunchAgent setup, and the explicit gaps compared with
+`mlx_lm.server`.
+
 ### Python API
 
 You can use `mlx-lm` as a module:
