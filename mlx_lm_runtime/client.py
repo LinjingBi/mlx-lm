@@ -79,6 +79,9 @@ class UnixRuntimeClient:
     def clear_cache(self):
         return self._request("clear_cache")
 
+    def unload(self):
+        return self._request("unload")
+
     def shutdown(self):
         return self._request("shutdown")
 

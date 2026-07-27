@@ -79,6 +79,8 @@ jobs:
               "mlx_lm/local_runtime/README.md",
               "mlx_lm/local_runtime/daemon.py",
               "mlx_lm/local_runtime/engine.py",
+              "mlx_lm/local_runtime/supervisor.py",
+              "mlx_lm/local_runtime/worker.py",
               "mlx_lm_runtime/client.py",
               "mlx_lm_runtime/protocol.py",
           }

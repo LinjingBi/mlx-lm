@@ -3,10 +3,11 @@
 import argparse
 import json
 import logging
+import logging.handlers
 import sys
 
 from mlx_lm_runtime.client import UnixRuntimeClient
-from mlx_lm_runtime.paths import DEFAULT_SOCKET_PATH
+from mlx_lm_runtime.paths import DEFAULT_SOCKET_PATH, LOG_DIR
 from mlx_lm_runtime.types import (
     GenerateRequest,
     GenerationDelta,
@@ -38,22 +39,34 @@ def _client(args):
 
 
 def _serve(args):
-    from .daemon import RuntimeDaemon
-    from .engine import SequentialRuntime
+    from .supervisor import RuntimeSupervisor, WorkerManager
 
+    LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "runtime.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+    )
+    file_handler.setFormatter(formatter)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[stream_handler, file_handler],
     )
-    engine = SequentialRuntime(
-        args.model,
-        adapter_path=args.adapter_path,
-        trust_remote_code=args.trust_remote_code,
-        prompt_cache_size=args.prompt_cache_size,
-        prompt_cache_bytes=args.prompt_cache_bytes,
-        prefill_step_size=args.prefill_step_size,
+    manager = WorkerManager(
+        {
+            "model": args.model,
+            "adapter_path": args.adapter_path,
+            "trust_remote_code": args.trust_remote_code,
+            "prompt_cache_size": args.prompt_cache_size,
+            "prompt_cache_bytes": args.prompt_cache_bytes,
+            "prefill_step_size": args.prefill_step_size,
+        },
+        idle_timeout=args.idle_timeout,
     )
-    RuntimeDaemon(engine, args.socket).serve_forever()
+    RuntimeSupervisor(manager, args.socket).serve_forever()
 
 
 def _generate(args):
@@ -105,6 +118,12 @@ def build_parser():
     serve.add_argument("--prompt-cache-size", type=int, default=4)
     serve.add_argument("--prompt-cache-bytes", type=_parse_size, default=2 * 1024**3)
     serve.add_argument("--prefill-step-size", type=int, default=2048)
+    serve.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300,
+        help="Unload the model worker after this many idle seconds; 0 disables.",
+    )
     serve.add_argument("--trust-remote-code", action="store_true")
     serve.add_argument("--verbose", action="store_true")
     serve.set_defaults(handler=_serve)
@@ -130,7 +149,7 @@ def build_parser():
     add_client_options(generate)
     generate.set_defaults(handler=_generate)
 
-    for name in ("health", "status", "clear-cache", "shutdown"):
+    for name in ("health", "status", "clear-cache", "unload", "shutdown"):
         command = subparsers.add_parser(name)
         add_client_options(command)
         method = name.replace("-", "_")
@@ -149,6 +168,12 @@ def build_parser():
     install.add_argument("--prompt-cache-size", type=int, default=4)
     install.add_argument("--prompt-cache-bytes", type=_parse_size, default=2 * 1024**3)
     install.add_argument("--prefill-step-size", type=int, default=2048)
+    install.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300,
+        help="Unload the model worker after this many idle seconds; 0 disables.",
+    )
     install.add_argument("--trust-remote-code", action="store_true")
     install.add_argument("--no-start", action="store_true")
     install.set_defaults(
@@ -160,6 +185,7 @@ def build_parser():
                 prompt_cache_size=args.prompt_cache_size,
                 prompt_cache_bytes=args.prompt_cache_bytes,
                 prefill_step_size=args.prefill_step_size,
+                idle_timeout=args.idle_timeout,
                 trust_remote_code=args.trust_remote_code,
                 start=not args.no_start,
             )
@@ -183,6 +209,7 @@ def main(argv=None):
             "health",
             "status",
             "clear-cache",
+            "unload",
             "shutdown",
         }
         description = (

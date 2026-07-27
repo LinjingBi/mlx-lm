@@ -25,6 +25,7 @@ def install_launch_agent(
     prompt_cache_size=4,
     prompt_cache_bytes=2 * 1024 * 1024 * 1024,
     prefill_step_size=2048,
+    idle_timeout=300,
     trust_remote_code=False,
     start=True,
 ):
@@ -45,6 +46,8 @@ def install_launch_agent(
         str(prompt_cache_bytes),
         "--prefill-step-size",
         str(prefill_step_size),
+        "--idle-timeout",
+        str(idle_timeout),
     ]
     if adapter_path:
         arguments.extend(["--adapter-path", str(adapter_path)])

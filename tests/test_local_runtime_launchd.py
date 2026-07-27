@@ -22,6 +22,7 @@ class TestLocalRuntimeLaunchd(unittest.TestCase):
                     socket_path=root / "runtime.sock",
                     prompt_cache_size=3,
                     prompt_cache_bytes=1234,
+                    idle_timeout=45,
                     start=False,
                 )
 
@@ -32,6 +33,8 @@ class TestLocalRuntimeLaunchd(unittest.TestCase):
             self.assertIn("mlx_lm.local_runtime.cli", arguments)
             self.assertIn("model-path", arguments)
             self.assertIn("1234", arguments)
+            self.assertIn("--idle-timeout", arguments)
+            self.assertIn("45", arguments)
             self.assertTrue(payload["RunAtLoad"])
             self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
 

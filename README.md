@@ -1,8 +1,10 @@
 # MLX-LM Local Runtime
 
-The local runtime keeps one MLX model and its prompt caches resident in a
-per-user macOS daemon. Short-lived Python programs and shell integrations call
-the daemon through a Unix domain socket instead of HTTP.
+The local runtime keeps a lightweight per-user supervisor available on a Unix
+domain socket. It starts a disposable MLX model worker on demand and unloads
+that worker after an idle timeout, releasing model weights and prompt caches.
+Short-lived Python programs and shell integrations call the supervisor instead
+of hosting MLX themselves or using HTTP.
 
 This interface is deliberately optimized for sequential, latency-sensitive
 local work such as shell-command completion. It is not a replacement for
@@ -12,7 +14,9 @@ local work such as shell-command completion. It is not a replacement for
 
 - Direct inference through `mlx_lm.stream_generate`; there is no HTTP,
   OpenAI-compatible request handling, or SSE layer.
-- One model loaded once and retained for the lifetime of the daemon.
+- One sequential model worker, loaded lazily and retained while it is active.
+- Configurable idle eviction that leaves the public socket and control APIs
+  available while model memory is released.
 - Full-prompt requests with automatic nearest-prefix matching through
   `LRUPromptCache`.
 - Transactional cache updates: a failed or disconnected request does not mutate
@@ -20,7 +24,8 @@ local work such as shell-command completion. It is not a replacement for
 - Streaming and non-streaming Python APIs.
 - A versioned, length-prefixed JSON protocol over an `AF_UNIX` stream socket.
 - A foreground daemon suitable for supervision by macOS `launchd`.
-- Health, status, cache-clear, and shutdown operations.
+- Health, lifecycle status, cache-clear, explicit unload, and shutdown
+  operations.
 - Socket directory mode `0700` and socket mode `0600` by default.
 
 ## Install this checkout
@@ -44,8 +49,14 @@ mlx_lm.runtime serve \
   --model mlx-community/Qwen3-4B-Instruct-2507-4bit \
   --prompt-cache-size 4 \
   --prompt-cache-bytes 2G \
-  --prefill-step-size 2048
+  --prefill-step-size 2048 \
+  --idle-timeout 300
 ```
+
+The supervisor does not load the model until the first generation request.
+After five idle minutes, the default `--idle-timeout 300` terminates the model
+worker and discards its in-memory prompt caches. The next generation reloads
+the model. Set `--idle-timeout 0` to keep the worker resident indefinitely.
 
 The default socket is:
 
@@ -108,6 +119,7 @@ mlx_lm.runtime generate \
   --verbose
 
 mlx_lm.runtime clear-cache
+mlx_lm.runtime unload
 mlx_lm.runtime shutdown
 ```
 
@@ -122,6 +134,64 @@ mlx_lm.runtime generate \
 The model tokenizer must provide a chat template for message requests. Models
 without one can still be used with a rendered raw prompt.
 
+## Query runtime status
+
+`health` reports whether the lightweight supervisor can accept requests. It
+continues to return `status: ok` when the model worker is unloaded:
+
+```sh
+mlx_lm.runtime health
+```
+
+`status` reports model residency, worker activity, the idle deadline, cache
+usage, and measured cold-start latency without loading or waking the model:
+
+```sh
+mlx_lm.runtime status
+```
+
+The single `worker_state` follows this lifecycle:
+
+```text
+unloaded -> loading -> ready -> busy -> ready -> unloading -> unloaded
+                    \-> failed                 \-> failed
+```
+
+- `unloaded`: the model is not resident; the next request is cold.
+- `loading`: a worker is loading the model for a waiting request.
+- `ready`: the model is resident and waiting for a request.
+- `busy`: generation is active.
+- `unloading`: the worker is exiting and releasing memory.
+- `failed`: worker startup or execution failed; a later request can retry.
+
+Important status fields include:
+
+```json
+{
+  "service_state": "running",
+  "worker_state": "ready",
+  "model_resident": true,
+  "next_request_cold": false,
+  "idle_timeout_seconds": 300.0,
+  "idle_for_seconds": 42.3,
+  "unload_in_seconds": 257.7,
+  "estimated_cold_start_ms": 3182.0,
+  "worker_pid": 41237,
+  "prompt_cache_entries": 2,
+  "prompt_cache_bytes": 123456789
+}
+```
+
+After idle eviction, `worker_state` is `unloaded`, `model_resident` is false,
+`next_request_cold` is true, and `unload_reason` is `idle_timeout`. During a
+generation, `worker_state` is `busy` and `request_running_for_ms` indicates how
+long it has been active. The legacy `active` field remains available and is
+equivalent to `worker_state == "busy"`.
+
+Health and status requests are handled concurrently by the supervisor, so they
+remain responsive during model loading and generation. Inference itself stays
+strictly sequential; a second simultaneous generation receives a `busy` error.
+
 ## Install as a macOS LaunchAgent
 
 Run this command from the Python environment where the checkout is installed:
@@ -130,7 +200,8 @@ Run this command from the Python environment where the checkout is installed:
 mlx_lm.runtime install-launch-agent \
   --model mlx-community/Qwen3-4B-Instruct-2507-4bit \
   --prompt-cache-size 4 \
-  --prompt-cache-bytes 2G
+  --prompt-cache-bytes 2G \
+  --idle-timeout 300
 ```
 
 It writes and starts:
@@ -144,6 +215,10 @@ Logs are written under:
 ```text
 ~/Library/Logs/mlx-lm-runtime/
 ```
+
+Structured lifecycle and timing events are written to `runtime.log`, which is
+rotated at 10 MiB with five backups. `stdout.log` and `stderr.log` remain
+launchd-level fallback logs.
 
 The LaunchAgent uses the absolute path of the Python interpreter that executes
 the install command. Moving or deleting that environment will break the agent.
@@ -165,9 +240,10 @@ Only the uncached suffix is processed by the model. At successful completion,
 the daemon inserts the prompt plus generated token IDs into the LRU. The cache
 has both entry-count and byte limits.
 
-Prompt caches are in memory only and are lost when the daemon exits. Cache reuse
-also depends on stable prompt serialization: changing a token near the beginning
-of a prompt invalidates everything after it.
+Prompt caches are in memory only and are lost when the worker is explicitly
+unloaded, reaches its idle timeout, fails, or the supervisor exits. Cache reuse
+also depends on stable prompt serialization: changing a token near the
+beginning of a prompt invalidates everything after it.
 
 Some hybrid, recurrent, sliding-window, or model-specific cache implementations
 cannot be trimmed safely. Such models may reuse fewer prefixes or fall back to
