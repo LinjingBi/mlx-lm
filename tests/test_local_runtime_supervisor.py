@@ -130,6 +130,12 @@ class TestWorkerManager(unittest.TestCase):
             self.assertEqual(manager.status()["cold_start_count"], 2)
         finally:
             manager.close()
+            self.assertFalse(
+                any(
+                    child.name == "mlx-lm-runtime-worker" and child.is_alive()
+                    for child in multiprocessing.active_children()
+                )
+            )
 
     def test_status_is_observable_while_busy(self):
         manager = self.make_manager(generation_delay=0.3)
@@ -193,8 +199,13 @@ class TestRuntimeSupervisor(unittest.TestCase):
                 generation.join(timeout=2)
                 self.assertFalse(generation.is_alive())
             finally:
-                client.shutdown()
+                try:
+                    client.shutdown()
+                except OSError:
+                    supervisor.close()
                 thread.join(timeout=2)
+                manager.close()
+                self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ jobs:
             tests/test_local_runtime_*.py
 
       - name: Run local runtime tests
+        timeout-minutes: 5
         run: |
           python -m unittest discover \
             -s tests \

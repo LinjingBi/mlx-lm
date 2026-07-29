@@ -1,5 +1,6 @@
 """Concurrent socket supervisor for a disposable MLX model worker."""
 
+import atexit
 import datetime
 import errno
 import logging
@@ -54,6 +55,7 @@ class WorkerManager:
         self._process = None
         self._connection = None
         self._idle_timer = None
+        self._closed = False
         self._state = "unloaded"
         self._unload_reason = "never_loaded"
         self._worker_status = {}
@@ -67,6 +69,9 @@ class WorkerManager:
         self._estimated_warm_first_token_ms = None
         self._cold_start_count = 0
         self._worker_restart_count = 0
+        # Ensure workers never block interpreter exit if a test or crash
+        # skips an explicit close(); multiprocessing joins non-daemons forever.
+        atexit.register(self._atexit_close)
 
     def _set_state(self, state, **updates):
         with self._state_lock:
@@ -83,29 +88,34 @@ class WorkerManager:
 
     def _schedule_idle_timer(self):
         self._cancel_idle_timer()
-        if self.idle_timeout == 0:
+        if self.idle_timeout == 0 or self._closed:
             return
         timer = threading.Timer(self.idle_timeout, self._idle_expired)
         timer.daemon = True
         with self._state_lock:
-            if self._state != "ready":
+            if self._closed or self._state != "ready":
                 return
             self._idle_timer = timer
         timer.start()
 
     def _idle_expired(self):
+        if self._closed:
+            return
         if not self._operation_lock.acquire(blocking=False):
-            self._schedule_idle_timer()
+            if not self._closed:
+                self._schedule_idle_timer()
             return
         try:
             with self._state_lock:
-                if self._state != "ready":
+                if self._closed or self._state != "ready":
                     return
             self._stop_worker_locked("idle_timeout")
         finally:
             self._operation_lock.release()
 
     def _start_worker_locked(self):
+        if self._closed:
+            raise RuntimeError("Worker manager is closed.")
         with self._state_lock:
             if self._state in ("ready", "busy"):
                 return
@@ -117,10 +127,13 @@ class WorkerManager:
             self._stop_process()
         logging.info("event=worker_starting reason=cold_request")
         parent, child = self._context.Pipe()
+        # Daemon workers must not outlive the supervisor; otherwise a leaked
+        # child blocks process shutdown via multiprocessing's infinite join.
         process = self._context.Process(
             target=self._worker_target,
             args=(child, self.config),
             name="mlx-lm-runtime-worker",
+            daemon=True,
         )
         process.start()
         child.close()
@@ -164,18 +177,28 @@ class WorkerManager:
     def _stop_process(self):
         process = self._process
         connection = self._connection
-        if connection is not None:
-            connection.close()
-        if process is not None:
-            process.join(timeout=self.stop_timeout)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=self.stop_timeout)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=self.stop_timeout)
         self._connection = None
         self._process = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if process is None:
+            return
+        process.join(timeout=self.stop_timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=self.stop_timeout)
+        if process.is_alive():
+            if hasattr(process, "kill"):
+                process.kill()
+            elif process.pid is not None:
+                try:
+                    os.kill(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            process.join(timeout=self.stop_timeout)
 
     def _stop_worker_locked(self, reason):
         self._cancel_idle_timer()
@@ -186,15 +209,17 @@ class WorkerManager:
                 return
             self._state = "unloading"
             cache_bytes = self._worker_status.get("prompt_cache_bytes", 0)
+            connection = self._connection
         logging.info(
             "event=worker_unloading reason=%s cache_bytes=%s", reason, cache_bytes
         )
-        try:
-            self._connection.send({"operation": "stop"})
-            if self._connection.poll(self.stop_timeout):
-                self._connection.recv()
-        except (EOFError, BrokenPipeError, OSError):
-            pass
+        if connection is not None:
+            try:
+                connection.send({"operation": "stop"})
+                if connection.poll(self.stop_timeout):
+                    connection.recv()
+            except (EOFError, BrokenPipeError, OSError):
+                pass
         self._stop_process()
         with self._state_lock:
             self._state = "unloaded"
@@ -281,7 +306,7 @@ class WorkerManager:
             if interrupted:
                 self._stop_process()
             self._operation_lock.release()
-            if ready:
+            if ready and not self._closed:
                 self._schedule_idle_timer()
 
     def clear_cache(self):
@@ -316,11 +341,26 @@ class WorkerManager:
             self._operation_lock.release()
 
     def close(self):
+        self._closed = True
+        self._cancel_idle_timer()
         self._operation_lock.acquire()
         try:
             self._stop_worker_locked("supervisor_shutdown")
         finally:
             self._operation_lock.release()
+
+    def _atexit_close(self):
+        if self._closed and self._process is None:
+            return
+        try:
+            self.close()
+        except Exception:
+            process = self._process
+            if process is not None and process.is_alive():
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
     def health(self):
         with self._state_lock:
