@@ -477,8 +477,12 @@ class RuntimeSupervisor:
 
     def _stop(self, *_):
         self._stopping.set()
-        if self._listener is not None:
-            self._listener.close()
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
 
     def _send_error(self, connection, request_id, exc):
         code = "busy" if isinstance(exc, RuntimeBusy) else "runtime_error"
@@ -561,6 +565,9 @@ class RuntimeSupervisor:
 
     def serve_forever(self, *, install_signal_handlers=True):
         self._prepare_socket()
+        # Poll so shutdown from a handler thread does not rely on close()
+        # unblocking accept(), which is not reliable across platforms.
+        self._listener.settimeout(0.5)
         if install_signal_handlers:
             signal.signal(signal.SIGTERM, self._stop)
             signal.signal(signal.SIGINT, self._stop)
@@ -569,6 +576,8 @@ class RuntimeSupervisor:
             while not self._stopping.is_set():
                 try:
                     connection, _ = self._listener.accept()
+                except socket.timeout:
+                    continue
                 except OSError as exc:
                     if self._stopping.is_set() or exc.errno in (
                         errno.EBADF,
@@ -587,7 +596,10 @@ class RuntimeSupervisor:
         finally:
             self.manager.close()
             if self._listener is not None:
-                self._listener.close()
+                try:
+                    self._listener.close()
+                except OSError:
+                    pass
                 self._listener = None
             self.socket_path.unlink(missing_ok=True)
 

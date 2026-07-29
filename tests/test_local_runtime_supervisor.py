@@ -202,7 +202,8 @@ class TestRuntimeSupervisor(unittest.TestCase):
                 try:
                     client.shutdown()
                 except OSError:
-                    supervisor.close()
+                    pass
+                supervisor.close()
                 thread.join(timeout=2)
                 manager.close()
                 self.assertFalse(thread.is_alive())
