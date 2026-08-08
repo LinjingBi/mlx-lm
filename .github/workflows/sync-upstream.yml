@@ -1,0 +1,138 @@
+name: Sync Upstream Into Local Runtime
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-local-runtime
+  cancel-in-progress: false
+
+env:
+  PATCH_BRANCH: codex/unix-native-runtime
+  UPSTREAM_REPOSITORY: ml-explore/mlx-lm
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    if: github.repository == 'LinjingBi/mlx-lm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out patched branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and synchronize fork main
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          short_sha="$(git rev-parse --short=12 "${upstream_sha}")"
+          sync_branch="automation/sync-${short_sha}"
+
+          git push origin \
+            "upstream/${UPSTREAM_BRANCH}:refs/heads/${UPSTREAM_BRANCH}"
+
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+          echo "sync_branch=${sync_branch}" >> "${GITHUB_OUTPUT}"
+
+          if git merge-base --is-ancestor \
+            "upstream/${UPSTREAM_BRANCH}" "${PATCH_BRANCH}"; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "The patched branch already contains upstream ${upstream_sha}."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code origin \
+            "refs/heads/${sync_branch}" >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              "${sync_branch}:refs/remotes/origin/${sync_branch}"
+            git switch -c "${sync_branch}" \
+              --track "origin/${sync_branch}"
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "Reusing existing candidate branch ${sync_branch}."
+            exit 0
+          fi
+
+          git switch -c "${sync_branch}" "${PATCH_BRANCH}"
+          git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Python
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime and test tools
+        if: steps.prepare.outputs.changed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[cpu]" build "ruff==0.15.21"
+
+      - name: Validate merge candidate
+        if: steps.prepare.outputs.changed == 'true'
+        run: |
+          ruff format --check \
+            mlx_lm/local_runtime \
+            mlx_lm_runtime \
+            tests/test_local_runtime_*.py
+          ruff check \
+            mlx_lm/local_runtime \
+            mlx_lm_runtime \
+            tests/test_local_runtime_*.py
+          python -m unittest discover \
+            -s tests \
+            -p 'test_local_runtime_*.py' \
+            -v
+          python -m build --wheel
+
+      - name: Push candidate and open pull request
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.prepare.outputs.sync_branch }}
+          UPSTREAM_SHA: ${{ steps.prepare.outputs.upstream_sha }}
+        run: |
+          git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+          existing_pr="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${PATCH_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -n "${existing_pr}" ]]; then
+            echo "Pull request #${existing_pr} already exists."
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${PATCH_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --title "Sync upstream main at ${UPSTREAM_SHA:0:12}" \
+            --body "This automated update merges \`${UPSTREAM_REPOSITORY}/${UPSTREAM_BRANCH}\` at \`${UPSTREAM_SHA}\` into \`${PATCH_BRANCH}\`.
+
+          The local runtime formatting, unit tests, and wheel build passed before this pull request was opened. Merge conflicts or failed validation stop the workflow before the patched branch is changed."

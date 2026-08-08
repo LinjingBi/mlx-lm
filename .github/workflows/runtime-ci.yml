@@ -1,0 +1,90 @@
+name: Local Runtime CI
+
+on:
+  push:
+    branches:
+      - codex/unix-native-runtime
+      - "automation/sync-**"
+  pull_request:
+    branches:
+      - codex/unix-native-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-runtime-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-tests:
+    if: github.repository == 'LinjingBi/mlx-lm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[cpu]" build "ruff==0.15.21"
+
+      - name: Check formatting and lint
+        run: |
+          ruff format --check \
+            mlx_lm/local_runtime \
+            mlx_lm_runtime \
+            tests/test_local_runtime_*.py
+          ruff check \
+            mlx_lm/local_runtime \
+            mlx_lm_runtime \
+            tests/test_local_runtime_*.py
+
+      - name: Run local runtime tests
+        timeout-minutes: 5
+        run: |
+          python -m unittest discover \
+            -s tests \
+            -p 'test_local_runtime_*.py' \
+            -v
+
+      - name: Verify lightweight client import
+        run: |
+          python - <<'PY'
+          import sys
+          import mlx_lm_runtime
+
+          assert "mlx" not in sys.modules
+          assert mlx_lm_runtime.UnixRuntimeClient.__name__ == "UnixRuntimeClient"
+          PY
+
+      - name: Build and inspect wheel
+        run: |
+          python -m build --wheel
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          (wheel,) = glob.glob("dist/*.whl")
+          with zipfile.ZipFile(wheel) as archive:
+              files = set(archive.namelist())
+          required = {
+              "mlx_lm/local_runtime/README.md",
+              "mlx_lm/local_runtime/daemon.py",
+              "mlx_lm/local_runtime/engine.py",
+              "mlx_lm/local_runtime/supervisor.py",
+              "mlx_lm/local_runtime/worker.py",
+              "mlx_lm_runtime/client.py",
+              "mlx_lm_runtime/protocol.py",
+          }
+          missing = required - files
+          assert not missing, "Missing wheel files: {}".format(sorted(missing))
+          PY
