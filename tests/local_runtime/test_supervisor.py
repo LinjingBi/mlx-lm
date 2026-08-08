@@ -22,56 +22,91 @@ def fake_worker(connection, config):
             },
         }
     )
+    active = {}
+    lock = threading.Lock()
+
+    def run_generate(request_id):
+        time.sleep(config.get("generation_delay", 0))
+        with lock:
+            if active.get(request_id) == "cancelled":
+                active.pop(request_id, None)
+                return
+        connection.send(
+            {
+                "kind": "event",
+                "id": request_id,
+                "event": "GenerationStarted",
+                "data": {
+                    "model": config["model"],
+                    "prompt_tokens": 1,
+                    "cached_tokens": 0,
+                },
+            }
+        )
+        connection.send(
+            {
+                "kind": "event",
+                "id": request_id,
+                "event": "GenerationDelta",
+                "data": {"text": "ok", "token": 1, "finish_reason": "length"},
+            }
+        )
+        connection.send(
+            {
+                "kind": "event",
+                "id": request_id,
+                "event": "GenerationFinished",
+                "data": {
+                    "finish_reason": "length",
+                    "prompt_tokens": 1,
+                    "cached_tokens": 0,
+                    "generation_tokens": 1,
+                    "prompt_tps": 1.0,
+                    "generation_tps": 1.0,
+                    "peak_memory_gb": 0.0,
+                    "ttft_seconds": 0.01,
+                    "total_seconds": 0.02,
+                },
+            }
+        )
+        connection.send(
+            {
+                "kind": "complete",
+                "id": request_id,
+                "status": {
+                    "prompt_cache_entries": 1,
+                    "prompt_cache_bytes": 64,
+                    "prompt_cache_by_type": {},
+                },
+            }
+        )
+        with lock:
+            active.pop(request_id, None)
+
     while True:
         command = connection.recv()
-        if command["operation"] == "generate":
-            time.sleep(config.get("generation_delay", 0))
-            connection.send(
-                {
-                    "kind": "event",
-                    "event": "GenerationStarted",
-                    "data": {
-                        "model": config["model"],
-                        "prompt_tokens": 1,
-                        "cached_tokens": 0,
-                    },
-                }
-            )
-            connection.send(
-                {
-                    "kind": "event",
-                    "event": "GenerationDelta",
-                    "data": {"text": "ok", "token": 1, "finish_reason": "length"},
-                }
-            )
-            connection.send(
-                {
-                    "kind": "event",
-                    "event": "GenerationFinished",
-                    "data": {
-                        "finish_reason": "length",
-                        "prompt_tokens": 1,
-                        "cached_tokens": 0,
-                        "generation_tokens": 1,
-                        "prompt_tps": 1.0,
-                        "generation_tps": 1.0,
-                        "peak_memory_gb": 0.0,
-                        "ttft_seconds": 0.01,
-                        "total_seconds": 0.02,
-                    },
-                }
-            )
-            connection.send(
-                {
-                    "kind": "complete",
-                    "status": {
-                        "prompt_cache_entries": 1,
-                        "prompt_cache_bytes": 64,
-                        "prompt_cache_by_type": {},
-                    },
-                }
-            )
-        elif command["operation"] == "clear_cache":
+        operation = command["operation"]
+        if operation == "generate":
+            request_id = command["id"]
+            with lock:
+                if len(active) >= config.get("decode_concurrency", 32):
+                    connection.send(
+                        {
+                            "kind": "error",
+                            "id": request_id,
+                            "message": "at cap",
+                            "code": "busy",
+                        }
+                    )
+                    continue
+                active[request_id] = "running"
+            threading.Thread(
+                target=run_generate, args=(request_id,), daemon=True
+            ).start()
+        elif operation == "cancel":
+            with lock:
+                active[command["id"]] = "cancelled"
+        elif operation == "clear_cache":
             connection.send(
                 {
                     "kind": "cleared",
@@ -82,15 +117,17 @@ def fake_worker(connection, config):
                     },
                 }
             )
-        elif command["operation"] == "stop":
+        elif operation == "stop":
             connection.send({"kind": "stopping", "status": {}})
             return
 
 
 class TestWorkerManager(unittest.TestCase):
     def make_manager(self, **kwargs):
+        config = {"model": "fake-model", "decode_concurrency": 32}
+        config.update(kwargs)
         return WorkerManager(
-            {"model": "fake-model", **kwargs},
+            config,
             idle_timeout=0.15,
             stop_timeout=0.5,
             process_context=multiprocessing.get_context("spawn"),
@@ -137,11 +174,12 @@ class TestWorkerManager(unittest.TestCase):
                 )
             )
 
-    def test_status_is_observable_while_busy(self):
+    def test_status_is_observable_while_busy_and_second_stream_can_run(self):
         manager = self.make_manager(generation_delay=0.3)
-        result = []
+        first = []
+        second = []
         thread = threading.Thread(
-            target=lambda: result.extend(manager.stream({"prompt": "hello"}))
+            target=lambda: first.extend(manager.stream({"prompt": "hello"}))
         )
         try:
             thread.start()
@@ -153,10 +191,30 @@ class TestWorkerManager(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(manager.status()["worker_state"], "busy")
             self.assertTrue(manager.status()["active"])
+            second.extend(manager.stream({"prompt": "second"}))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(first[-1]["event"], "GenerationFinished")
+            self.assertEqual(second[-1]["event"], "GenerationFinished")
+        finally:
+            manager.close()
+
+    def test_decode_concurrency_cap_raises_busy(self):
+        manager = self.make_manager(generation_delay=0.4, decode_concurrency=1)
+        thread = threading.Thread(
+            target=lambda: list(manager.stream({"prompt": "hello"}))
+        )
+        try:
+            thread.start()
+            deadline = time.monotonic() + 2
+            while (
+                manager.status().get("active_requests", 0) < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
             with self.assertRaises(RuntimeBusy):
                 list(manager.stream({"prompt": "second"}))
             thread.join(timeout=2)
-            self.assertFalse(thread.is_alive())
         finally:
             manager.close()
 
@@ -166,7 +224,11 @@ class TestRuntimeSupervisor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             socket_path = os.path.join(directory, "runtime.sock")
             manager = WorkerManager(
-                {"model": "fake-model", "generation_delay": 0.3},
+                {
+                    "model": "fake-model",
+                    "generation_delay": 0.3,
+                    "decode_concurrency": 32,
+                },
                 idle_timeout=0,
                 stop_timeout=0.5,
                 process_context=multiprocessing.get_context("spawn"),
@@ -194,7 +256,9 @@ class TestRuntimeSupervisor(unittest.TestCase):
                     and time.monotonic() < deadline
                 ):
                     time.sleep(0.01)
-                self.assertEqual(client.health()["status"], "ok")
+                health = client.health()
+                self.assertEqual(health["status"], "ok")
+                self.assertFalse(health["sequential"])
                 self.assertEqual(client.status()["worker_state"], "busy")
                 generation.join(timeout=2)
                 self.assertFalse(generation.is_alive())

@@ -63,6 +63,8 @@ def _serve(args):
             "prompt_cache_size": args.prompt_cache_size,
             "prompt_cache_bytes": args.prompt_cache_bytes,
             "prefill_step_size": args.prefill_step_size,
+            "prompt_concurrency": args.prompt_concurrency,
+            "decode_concurrency": args.decode_concurrency,
         },
         idle_timeout=args.idle_timeout,
     )
@@ -107,7 +109,7 @@ def _print_json(value):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mlx_lm.runtime",
-        description="Run and access a sequential MLX-LM Unix-socket daemon.",
+        description="Run and access a local MLX-LM Unix-socket runtime.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -118,6 +120,18 @@ def build_parser():
     serve.add_argument("--prompt-cache-size", type=int, default=4)
     serve.add_argument("--prompt-cache-bytes", type=_parse_size, default=2 * 1024**3)
     serve.add_argument("--prefill-step-size", type=int, default=2048)
+    serve.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=8,
+        help="Max prompts processed in parallel when batching (default: 8).",
+    )
+    serve.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=32,
+        help="Max concurrent generations / decode batch size (default: 32).",
+    )
     serve.add_argument(
         "--idle-timeout",
         type=float,
@@ -168,6 +182,8 @@ def build_parser():
     install.add_argument("--prompt-cache-size", type=int, default=4)
     install.add_argument("--prompt-cache-bytes", type=_parse_size, default=2 * 1024**3)
     install.add_argument("--prefill-step-size", type=int, default=2048)
+    install.add_argument("--prompt-concurrency", type=int, default=8)
+    install.add_argument("--decode-concurrency", type=int, default=32)
     install.add_argument(
         "--idle-timeout",
         type=float,
@@ -185,6 +201,8 @@ def build_parser():
                 prompt_cache_size=args.prompt_cache_size,
                 prompt_cache_bytes=args.prompt_cache_bytes,
                 prefill_step_size=args.prefill_step_size,
+                prompt_concurrency=args.prompt_concurrency,
+                decode_concurrency=args.decode_concurrency,
                 idle_timeout=args.idle_timeout,
                 trust_remote_code=args.trust_remote_code,
                 start=not args.no_start,

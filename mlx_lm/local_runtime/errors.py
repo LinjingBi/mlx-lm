@@ -2,4 +2,4 @@
 
 
 class RuntimeBusy(RuntimeError):
-    """The sequential runtime is already executing a generation."""
+    """The runtime cannot accept the operation right now (busy or at cap)."""

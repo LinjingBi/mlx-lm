@@ -6,15 +6,17 @@ that worker after an idle timeout, releasing model weights and prompt caches.
 Short-lived Python programs and shell integrations call the supervisor instead
 of hosting MLX themselves or using HTTP.
 
-This interface is deliberately optimized for sequential, latency-sensitive
-local work such as shell-command completion. It is not a replacement for
-`mlx_lm.server` when several requests need to run concurrently.
+This interface is optimized for same-machine, latency-sensitive local work such
+as shell-command completion. It supports **partial** continuous batching for
+concurrent `GenerateRequest` calls against one resident model. It is not a
+drop-in replacement for `mlx_lm.server` (see Scheduling limitations).
 
 ## Main features
 
-- Direct inference through `mlx_lm.stream_generate`; there is no HTTP,
-  OpenAI-compatible request handling, or SSE layer.
-- One sequential model worker, loaded lazily and retained while it is active.
+- Direct inference through `BatchGenerator` / `stream_generate`; there is no
+  HTTP, OpenAI-compatible request handling, or SSE layer.
+- One model worker, loaded lazily and retained while it is active, with
+  concurrent generates up to `--decode-concurrency`.
 - Configurable idle eviction that leaves the public socket and control APIs
   available while model memory is released.
 - Full-prompt requests with automatic nearest-prefix matching through
@@ -50,6 +52,8 @@ mlx_lm.runtime serve \
   --prompt-cache-size 4 \
   --prompt-cache-bytes 2G \
   --prefill-step-size 2048 \
+  --prompt-concurrency 8 \
+  --decode-concurrency 32 \
   --idle-timeout 300
 ```
 
@@ -189,8 +193,9 @@ long it has been active. The legacy `active` field remains available and is
 equivalent to `worker_state == "busy"`.
 
 Health and status requests are handled concurrently by the supervisor, so they
-remain responsive during model loading and generation. Inference itself stays
-strictly sequential; a second simultaneous generation receives a `busy` error.
+remain responsive during model loading and generation. Multiple generate
+connections can make progress together up to `--decode-concurrency`; beyond
+that cap a new generate receives a `busy` error.
 
 ## Install as a macOS LaunchAgent
 
@@ -272,10 +277,10 @@ the client simple and works well for short-lived shell processes.
 
 | Capability | Local runtime | `mlx_lm.server` |
 |---|---|---|
-| Active inference | Exactly one | Multiple requests |
-| Continuous batching | Not supported | Uses `BatchGenerator` |
-| Prompt/decode concurrency | Not supported | Configurable |
-| Scheduling | Connections wait serially | Batched request scheduler |
+| Active inference | Up to decode concurrency | Multiple requests |
+| Continuous batching | **Partial** — same-model `GenerateRequest` only | Uses `BatchGenerator` |
+| Prompt/decode concurrency | Configurable | Configurable |
+| Scheduling | Local twin of ResponseGenerator | Batched request scheduler |
 | Transport | Same-machine Unix socket | OpenAI-like HTTP API |
 | OpenAI SDK compatibility | No | Yes |
 | Network or browser access | No | HTTP, streaming, and CORS |
@@ -290,17 +295,28 @@ the client simple and works well for short-lived shell processes.
 | Logit bias and penalties | No | Supported |
 | Draft/speculative generation | No | Supported on the sequential path |
 | Distributed inference | No | Supported |
-| Status during generation | Waits behind generation | HTTP worker remains responsive |
+| Status during generation | Supervisor remains responsive | HTTP worker remains responsive |
 | Cache persistence after exit | No | No by default |
 
-The daemon listens with a socket backlog of one but does not execute requests in
-parallel. A second client may connect and then wait until the current generation
-finishes. This is intentional: one worker owns all MLX execution and all mutable
-cache state.
-
 The local runtime currently exposes temperature, top-p, top-k, min-p, seed,
-maximum tokens, and stop strings. The narrower surface keeps the sequential path
+maximum tokens, and stop strings. The narrower surface keeps the generate API
 small and auditable.
+
+## Scheduling limitations
+
+Continuous batching here is intentionally narrower than `mlx_lm.server`:
+
+| Area | Local runtime | `mlx_lm.server` |
+|---|---|---|
+| Continuous batching | Concurrent `generate` ops on the resident model | Yes |
+| Models in one process | One fixed startup model/adapter | Multi-model / on-demand load; drain on model switch |
+| Request API | `GenerateRequest` only | Full OpenAI-ish args (tools, logprobs, penalties, draft, …) |
+| Seeded requests | Sequential / drain — not batched | Same |
+| Draft / speculative | Not supported | Sequential path |
+| Segmented prompt-cache checkpoints | Not in first pass (flat cache) | System/user/assistant segments |
+| Transport | Unix, one op per connection; concurrency = many connections | HTTP + SSE |
+| Backpressure | `busy` at decode-concurrency cap | Queue into `ResponseGenerator` (HTTP threads wait) |
+| Distributed | No | Optional |
 
 ## When to use which interface
 
@@ -308,13 +324,12 @@ Use the local runtime when:
 
 - all callers are on the same Mac;
 - client processes are short lived;
-- latency matters more than aggregate throughput;
-- inference is naturally sequential;
-- one resident model is enough.
+- one resident model is enough;
+- the narrow `GenerateRequest` surface is enough;
+- partial continuous batching (same model, capped concurrency) is acceptable.
 
-Use `mlx_lm.server` when several callers must make progress simultaneously,
-continuous batching matters, OpenAI API compatibility is required, or the
-caller is not able to access a local Unix socket.
+Use `mlx_lm.server` when multi-model serving, OpenAI API compatibility, rich
+sampling/tool features, or unconstrained concurrent HTTP clients are required.
 
 ## Maintaining the downstream patch
 

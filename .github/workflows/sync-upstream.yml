@@ -95,14 +95,13 @@ jobs:
           ruff format --check \
             mlx_lm/local_runtime \
             mlx_lm_runtime \
-            tests/test_local_runtime_*.py
+            tests/local_runtime
           ruff check \
             mlx_lm/local_runtime \
             mlx_lm_runtime \
-            tests/test_local_runtime_*.py
+            tests/local_runtime
           python -m unittest discover \
-            -s tests \
-            -p 'test_local_runtime_*.py' \
+            -s tests/local_runtime \
             -v
           python -m build --wheel
 

@@ -35,6 +35,8 @@ class TestLocalRuntimeLaunchd(unittest.TestCase):
             self.assertIn("1234", arguments)
             self.assertIn("--idle-timeout", arguments)
             self.assertIn("45", arguments)
+            self.assertIn("--prompt-concurrency", arguments)
+            self.assertIn("--decode-concurrency", arguments)
             self.assertTrue(payload["RunAtLoad"])
             self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
 
