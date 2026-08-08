@@ -731,6 +731,7 @@ class RuntimeSupervisor:
                     self._threads.add(thread)
                 thread.start()
         finally:
+            logging.info("event=supervisor_stopping socket=%s", self.socket_path)
             self.manager.close()
             if self._listener is not None:
                 try:
@@ -739,6 +740,7 @@ class RuntimeSupervisor:
                     pass
                 self._listener = None
             self.socket_path.unlink(missing_ok=True)
+            logging.info("event=supervisor_stopped")
 
     def close(self):
         self._stop()

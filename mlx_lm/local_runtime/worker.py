@@ -98,7 +98,7 @@ def run_worker(connection, config):
                             "code": "busy",
                         }
                     )
-                except BaseException as exc:
+                except Exception as exc:
                     send(
                         {
                             "kind": "error",
@@ -123,7 +123,7 @@ def run_worker(connection, config):
                     send({"kind": "cleared", "status": generator.status()})
                 except RuntimeBusy as exc:
                     send({"kind": "error", "message": str(exc), "code": "busy"})
-                except BaseException as exc:
+                except Exception as exc:
                     send({"kind": "error", "message": str(exc)})
             elif operation == "stop":
                 generator.stop()
@@ -138,6 +138,8 @@ def run_worker(connection, config):
                 )
     except (EOFError, BrokenPipeError, OSError):
         logging.info("Worker pipe closed.")
+    except KeyboardInterrupt:
+        logging.info("Worker interrupted; shutting down.")
     finally:
         try:
             generator.stop()

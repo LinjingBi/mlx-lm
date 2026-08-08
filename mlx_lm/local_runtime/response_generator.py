@@ -148,7 +148,8 @@ class LocalResponseGenerator:
         self._drain_batch = False
         self._stop = False
         self._time_budget = _TimeBudget()
-        self._generation_stream = mx.default_stream(mx.default_device())
+        # MLX streams are thread-local; create this inside `_run`, not here.
+        self._generation_stream = None
         self._thread = Thread(
             target=self._run, name="local-response-generator", daemon=True
         )
@@ -226,9 +227,8 @@ class LocalResponseGenerator:
     def stop(self):
         self._stop = True
         self._thread.join(timeout=5)
-        if self._batch_generator is not None:
-            self._batch_generator.close()
-            self._batch_generator = None
+        # BatchGenerator must be closed on the generator thread (see `_run`
+        # finally). Avoid mx.synchronize from this thread.
 
     def _tokenize(self, request: GenerateRequest) -> List[int]:
         if request.prompt is not None:
@@ -315,6 +315,8 @@ class LocalResponseGenerator:
         self._drop_active(active.request_id)
 
     def _ensure_batch_generator(self):
+        if self._generation_stream is None:
+            raise RuntimeError("Generation stream is not initialized on this thread.")
         if self._batch_generator is None:
             self._batch_generator = BatchGenerator(
                 self.model,
@@ -325,10 +327,17 @@ class LocalResponseGenerator:
             )
 
     def _close_batch_generator(self):
-        if self._batch_generator is not None:
-            self._batch_generator.close()
-            self._batch_generator = None
+        batch_generator = self._batch_generator
+        self._batch_generator = None
         self._drain_batch = False
+        if batch_generator is None:
+            return
+        try:
+            batch_generator.close()
+        except RuntimeError:
+            # Wrong-thread or torn-down stream during process shutdown.
+            # Disarm __del__ so it does not retry mx.synchronize.
+            batch_generator._old_wired_limit = None
 
     def _admit_batchable(self, pending: _Pending):
         with self._active_lock:
@@ -436,52 +445,53 @@ class LocalResponseGenerator:
                 text_state = text_filter.make_state("normal")
 
             cache_key = list(prompt_tokens)
-            generation = stream_generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                prompt=uncached_tokens,
-                max_tokens=pending.request.max_tokens,
-                sampler=sampler,
-                prompt_cache=cache,
-                prefill_step_size=self.prefill_step_size,
-            )
+            with mx.stream(self._generation_stream):
+                generation = stream_generate(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    prompt=uncached_tokens,
+                    max_tokens=pending.request.max_tokens,
+                    sampler=sampler,
+                    prompt_cache=cache,
+                    prefill_step_size=self.prefill_step_size,
+                )
 
-            finish_reason = None
-            final_response = None
-            for response in generation:
-                if active.cancelled:
-                    break
-                if active.first_token_at is None:
-                    active.first_token_at = time.perf_counter()
-                final_response = response
-                cache_key.append(response.token)
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, response.token
-                )
-                finish_reason = "stop" if matched else response.finish_reason
-                text = response.text
-                if text_filter is not None:
-                    text_state, text, _ = TextStateMachine.step(text_state, text)
-                    if finish_reason == "stop":
-                        text_state, _ = TextStateMachine.discard(text_state)
-                    elif finish_reason is not None:
-                        text_state, tail, _ = TextStateMachine.flush(text_state)
-                        text += tail
-                active.generation_tokens = response.generation_tokens
-                active.prompt_tps = response.prompt_tps
-                active.generation_tps = response.generation_tps
-                active.peak_memory_gb = response.peak_memory
-                self._emit(
-                    pending.request_id,
-                    "GenerationDelta",
-                    {
-                        "text": text,
-                        "token": response.token,
-                        "finish_reason": finish_reason,
-                    },
-                )
-                if finish_reason is not None:
-                    break
+                finish_reason = None
+                final_response = None
+                for response in generation:
+                    if active.cancelled:
+                        break
+                    if active.first_token_at is None:
+                        active.first_token_at = time.perf_counter()
+                    final_response = response
+                    cache_key.append(response.token)
+                    stop_state, matched = StopSequenceMatcher.match(
+                        stop_state, stop_matcher._trie, response.token
+                    )
+                    finish_reason = "stop" if matched else response.finish_reason
+                    text = response.text
+                    if text_filter is not None:
+                        text_state, text, _ = TextStateMachine.step(text_state, text)
+                        if finish_reason == "stop":
+                            text_state, _ = TextStateMachine.discard(text_state)
+                        elif finish_reason is not None:
+                            text_state, tail, _ = TextStateMachine.flush(text_state)
+                            text += tail
+                    active.generation_tokens = response.generation_tokens
+                    active.prompt_tps = response.prompt_tps
+                    active.generation_tps = response.generation_tps
+                    active.peak_memory_gb = response.peak_memory
+                    self._emit(
+                        pending.request_id,
+                        "GenerationDelta",
+                        {
+                            "text": text,
+                            "token": response.token,
+                            "finish_reason": finish_reason,
+                        },
+                    )
+                    if finish_reason is not None:
+                        break
 
             if active.cancelled:
                 self._drop_active(pending.request_id)
@@ -593,50 +603,56 @@ class LocalResponseGenerator:
             self._close_batch_generator()
 
     def _run(self):
-        while not self._stop:
-            pending = None
-            if not self._drain_batch:
-                with self._active_lock:
-                    has_batch_work = any(
-                        a.uid is not None for a in self._active.values()
+        # Must be created on this thread; MLX streams are not portable across threads.
+        self._generation_stream = mx.default_stream(mx.default_device())
+        try:
+            while not self._stop:
+                pending = None
+                if not self._drain_batch:
+                    with self._active_lock:
+                        has_batch_work = any(
+                            a.uid is not None for a in self._active.values()
+                        )
+                    timeout = (
+                        None
+                        if (self._batch_generator is not None and has_batch_work)
+                        else 0.1
                     )
-                timeout = (
-                    None
-                    if (self._batch_generator is not None and has_batch_work)
-                    else 0.1
-                )
-                pending = self._next_pending(timeout=timeout)
+                    pending = self._next_pending(timeout=timeout)
 
-            if pending is not None:
-                with self._active_lock:
-                    active = self._active.get(pending.request_id)
-                if active is None or active.cancelled:
-                    self._drop_active(pending.request_id)
+                if pending is not None:
+                    with self._active_lock:
+                        active = self._active.get(pending.request_id)
+                    if active is None or active.cancelled:
+                        self._drop_active(pending.request_id)
+                        continue
+
+                    batchable = self._is_request_batchable(pending.request)
+                    if (
+                        self._batch_generator is not None
+                        and batchable
+                        and not self._drain_batch
+                    ):
+                        self._admit_batchable(pending)
+                        continue
+
+                    if self._batch_generator is None:
+                        if batchable:
+                            self._ensure_batch_generator()
+                            self._unprocessed.append(pending)
+                        else:
+                            self._serve_sequential(pending)
+                        continue
+
+                    # Live batch cannot accept this request (seeded / non-batchable).
+                    self._drain_batch = True
+                    self._unprocessed.append(pending)
                     continue
 
-                batchable = self._is_request_batchable(pending.request)
-                if (
-                    self._batch_generator is not None
-                    and batchable
-                    and not self._drain_batch
-                ):
-                    self._admit_batchable(pending)
-                    continue
-
-                if self._batch_generator is None:
-                    if batchable:
-                        self._ensure_batch_generator()
-                        self._unprocessed.append(pending)
-                    else:
-                        self._serve_sequential(pending)
-                    continue
-
-                # Live batch cannot accept this request (seeded / non-batchable).
-                self._drain_batch = True
-                self._unprocessed.append(pending)
-                continue
-
-            if self._batch_generator is not None:
-                self._step_batch()
-            elif self._drain_batch:
-                self._drain_batch = False
+                if self._batch_generator is not None:
+                    self._step_batch()
+                elif self._drain_batch:
+                    self._drain_batch = False
+        finally:
+            self._close_batch_generator()
+            self._generation_stream = None
