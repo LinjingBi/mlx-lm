@@ -1,0 +1,32 @@
+---
+description: Fork branch roles and CI/CD contract for the unix-runtime patch
+alwaysApply: true
+---
+
+# Fork CI/CD contract
+
+This checkout is a downstream patch of `ml-explore/mlx-lm`. Do not treat it like a normal fork that merges into `main`.
+
+## Branch roles
+
+- `main` is a fast-forward-only mirror of `ml-explore/mlx-lm` `main`. It must never contain unix-runtime commits.
+- `codex/unix-native-runtime` is the patched working branch and the fork default branch. All runtime work lands here.
+- `automation/sync-<upstream-sha>` is a disposable PR head. Never use `main` as a PR head or base.
+
+Never merge `codex/unix-native-runtime` (or any runtime commit) into `main`. That breaks the weekly fast-forward.
+
+## Which workflow does what
+
+- `Sync Upstream Into Local Runtime` (`.github/workflows/sync-upstream.yml`) is the only job that updates `main` or opens a sync PR. It fast-forwards fork `main`, merges upstream into a candidate branch, validates, and opens `automation/sync-<sha>` → `codex/unix-native-runtime`. It does not rebase, force-push, or change the patched branch. If `main` cannot fast-forward, fail; do not force-push.
+- `Local Runtime CI` (`.github/workflows/runtime-ci.yml`) only tests. It never updates branches or opens PRs.
+- `Build and Test` and `PyPI Release` are upstream workflows. They no-op on this fork (`github.repository == 'ml-explore/mlx-lm'`). Let sync update them.
+
+## Do not overwrite upstream files
+
+- Keep product docs in `mlx_lm/local_runtime/README.md`. That path does not exist upstream.
+- Do not replace root `README.md`, `CONTRIBUTING.md`, or other upstream files with runtime docs. The next sync merge will conflict.
+- Do not put this contract in those upstream files. This rule is the durable copy.
+
+## One-time repair only (when explicitly asked)
+
+Fork `main` currently diverged and may be reset to upstream `main` once. After that, weekly sync is a normal fast-forward. Do not force-push `main` as routine.
